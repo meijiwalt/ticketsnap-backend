@@ -154,6 +154,15 @@ const DEFAULT_NEGATIVE_KEYWORDS = [
   'join the waiting room', 'you are in line', 'queue', 'waiting room'
 ];
 
+function getPageTitle(html = '') {
+  const text = String(html || '');
+  const match = text.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+  if (match && match[1]) {
+    return match[1].replace(/\s+/g, ' ').trim().slice(0, 180);
+  }
+  return text.replace(/\s+/g, ' ').trim().slice(0, 180);
+}
+
 function hashContent(input = '') {
   return crypto.createHash('sha256').update(String(input).slice(0, 750000)).digest('hex');
 }
@@ -363,8 +372,7 @@ async function checkAvailability(id, manual = false) {
     m.lastNegativeHits = result.negativeHits || [];
     m.lastMatchedActions = matchedActions;
     m.lastDiagnostics = {
-      title: (html.split('
-')[0] || '').slice(0, 180),
+      title: getPageTitle(html),
       finalUrl: snapshot.finalUrl || m.ticketUrl,
       candidateCount: Array.isArray(snapshot.candidates) ? snapshot.candidates.length : 0,
       blocked: result.blocked,
@@ -579,7 +587,7 @@ app.post('/api/monitor/analyze-url', requireAuth, async (req, res) => {
     const result = analyzeAvailability(html, pos, neg, snapshot.status, snapshot.engine);
     const matchedActions = findMatchedActions(snapshot.candidates || [], pos, neg, snapshot.finalUrl || ticketUrl);
     const preferredAction = matchedActions.find(a => a && a.href && /^https?:\/\//i.test(String(a.href)));
-    res.json({ ok: true, httpStatus: snapshot.status, engine: snapshot.engine, result, signals: summarizePage(html, pos, neg), matchedActions, preferredManualUrl: preferredAction ? preferredAction.href : null, diagnostics: { title: (html.split('\n')[0] || '').slice(0,180), finalUrl: snapshot.finalUrl || ticketUrl, candidateCount: Array.isArray(snapshot.candidates) ? snapshot.candidates.length : 0, blocked: result.blocked, status: snapshot.status } });
+    res.json({ ok: true, httpStatus: snapshot.status, engine: snapshot.engine, result, signals: summarizePage(html, pos, neg), matchedActions, preferredManualUrl: preferredAction ? preferredAction.href : null, diagnostics: { title: getPageTitle(html), finalUrl: snapshot.finalUrl || ticketUrl, candidateCount: Array.isArray(snapshot.candidates) ? snapshot.candidates.length : 0, blocked: result.blocked, status: snapshot.status } });
   } catch (e) {
     res.status(502).json({ error: e.message });
   }
