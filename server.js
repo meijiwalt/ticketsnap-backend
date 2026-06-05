@@ -16,8 +16,9 @@ const TELEGRAM_TOKEN   = process.env.TELEGRAM_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const JWT_SECRET       = process.env.JWT_SECRET || 'CHANGE_ME_IN_RENDER_ENV';
 const DATA_FILE        = process.env.DATA_FILE || path.join(__dirname, 'data.json');
-const DEFAULT_INTERVAL = Math.max(30, Number(process.env.DEFAULT_CHECK_INTERVAL_SEC || 60));
-const MIN_INTERVAL     = Math.max(20, Number(process.env.MIN_CHECK_INTERVAL_SEC || 30));
+const DEFAULT_INTERVAL = Math.max(15, Number(process.env.DEFAULT_CHECK_INTERVAL_SEC || 30));
+// Keep this reasonable so the private checker does not hammer ticketing sites.
+const MIN_INTERVAL     = Math.max(5, Number(process.env.MIN_CHECK_INTERVAL_SEC || 15));
 const USE_BROWSER_CHECKER = String(process.env.USE_BROWSER_CHECKER || 'true').toLowerCase() !== 'false';
 const BROWSER_CHECK_TIMEOUT_MS = Math.max(15000, Number(process.env.BROWSER_CHECK_TIMEOUT_MS || 25000));
 
@@ -455,7 +456,7 @@ function scheduleAlerts(id) {
   }
 }
 
-function startAvailabilityChecker(id) {
+async function startAvailabilityChecker(id) {
   const m = monitors[id];
   if (!m || !m.availabilityCheck || m.status === 'stopped') return;
   if (m.checker) clearInterval(m.checker);
@@ -466,11 +467,12 @@ function startAvailabilityChecker(id) {
     const saleMs = new Date(fresh.saleTime).getTime();
     const minutesToSale = (saleMs - Date.now()) / 60000;
     const configured = Math.max(MIN_INTERVAL, Number(fresh.checkIntervalSec || DEFAULT_INTERVAL));
-    const adaptive = minutesToSale <= 10 ? Math.min(configured, 30) : configured;
+    const adaptive = minutesToSale <= 2 ? Math.min(configured, 5) : minutesToSale <= 10 ? Math.min(configured, 10) : minutesToSale <= 30 ? Math.min(configured, 15) : minutesToSale <= 60 ? Math.min(configured, 20) : Math.min(configured, 30);
     clearInterval(fresh.checker);
     fresh.checker = setInterval(tick, adaptive * 1000);
   };
-  checkAvailability(id, true);
+  // Run the first check immediately so the Watch tab does not wait for the first interval.
+  await checkAvailability(id, true);
   const intervalSec = Math.max(MIN_INTERVAL, Number(m.checkIntervalSec || DEFAULT_INTERVAL));
   m.checker = setInterval(tick, intervalSec * 1000);
 }
@@ -537,7 +539,7 @@ app.post('/api/monitor/start', requireAuth, async (req, res) => {
   };
   addActivity(monitors[id], 'created', 'Monitor created and legitimate availability checks started.');
   scheduleAlerts(id);
-  startAvailabilityChecker(id);
+  await startAvailabilityChecker(id);
   saveData();
   await sendTelegram(`👀 <b>Monitor started</b>\n\nEvent: <b>${eventName}</b>\nSale: <b>${new Date(saleTime).toLocaleString('en-PH', { timeZone: 'Asia/Manila' })} PHT</b>\nAvailability check: <b>${availabilityCheck ? 'ON' : 'OFF'}</b>\nLink: <a href="${ticketUrl}">${ticketUrl}</a>`);
   res.json({ id, status: monitors[id].status });
@@ -560,6 +562,21 @@ app.post('/api/monitor/stop', requireAuth, (req, res) => {
   m.timers?.forEach(t => clearTimeout(t));
   if (m.checker) clearInterval(m.checker);
   m.status = 'stopped';
+  saveData();
+  res.json({ ok: true });
+});
+
+
+app.delete('/api/monitor/:id', requireAuth, (req, res) => {
+  const m = monitors[req.params.id];
+  if (!m) return res.status(404).json({ error: 'Not found' });
+  if (m.ownerId !== req.user.id && req.user.role !== 'admin') return res.status(403).json({ error: 'Forbidden' });
+  m.timers?.forEach(t => clearTimeout(t));
+  if (m.checker) clearInterval(m.checker);
+  delete monitors[req.params.id];
+  if (req.params.id === req.body?.activeMonitorId) {
+    // no-op helper for older clients
+  }
   saveData();
   res.json({ ok: true });
 });
