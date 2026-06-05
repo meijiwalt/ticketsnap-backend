@@ -190,8 +190,11 @@ async function checkAvailability(id, manual = false) {
       m.availableAt = nowIso;
       addActivity(m, 'availability', result.reason);
       await sendTelegram(`🎟 <b>POSSIBLE TICKET AVAILABILITY DETECTED</b>\n\n<b>${m.eventName}</b>\n${result.reason}\n\n👉 <a href="${m.ticketUrl}">Open official ticket page now</a>`);
-    } else if (!result.available && m.status !== 'live') {
+    } else if (!result.available && m.status !== 'stopped') {
+      // Important: sale time alone is NOT availability.
+      // Keep monitoring until the official page check finds real positive availability signals.
       m.status = 'checking';
+      m.availableAt = null;
     }
     saveData();
     return { ...result, httpStatus: r.status, manual, pageChanged, signals: m.lastSignals };
@@ -220,12 +223,19 @@ function scheduleAlerts(id) {
   add(5 * 60 * 1000, () => sendTelegram(`⏰ <b>5 minutes to go!</b>\n\n<b>${m.eventName}</b> tickets may open in 5 minutes.\n\n👉 <a href="${m.ticketUrl}">Get ready</a>`));
   add(1 * 60 * 1000, () => sendTelegram(`🔔 <b>1 minute!</b>\n\n<b>${m.eventName}</b> — be ready on your screen.\n\n👉 <a href="${m.ticketUrl}">Stand by</a>`));
   add(0, async () => {
-    if (monitors[id] && monitors[id].status !== 'available') monitors[id].status = 'live';
+    if (monitors[id] && monitors[id].status !== 'available' && monitors[id].status !== 'stopped') {
+      // Sale time reached is only a reminder, not proof that tickets are available.
+      monitors[id].status = 'checking';
+      monitors[id].saleTimeReached = true;
+    }
     saveData();
-    await sendTelegram(`🎟 <b>SALE TIME REACHED</b>\n\n<b>${m.eventName}</b>\n\n👉 <a href="${m.ticketUrl}">Open Ticketmaster</a>`);
+    await sendTelegram(`🎟 <b>SALE TIME REACHED</b>\n\n<b>${m.eventName}</b>\nThis is only the scheduled sale time. TicketSnap will still wait for page signals before marking tickets as available.\n\n👉 <a href="${m.ticketUrl}">Open official ticket page</a>`);
     checkAvailability(id, true);
   });
-  if (saleMs <= now && m.status !== 'available') m.status = 'live';
+  if (saleMs <= now && m.status !== 'available' && m.status !== 'stopped') {
+    m.status = 'checking';
+    m.saleTimeReached = true;
+  }
 }
 
 function startAvailabilityChecker(id) {
