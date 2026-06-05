@@ -102,7 +102,12 @@ function requireAuth(req, res, next) {
 }
 
 function requireAdmin(req, res, next) {
-  if (req.user?.role !== 'admin') return res.status(403).json({ error: 'Forbidden' });
+  // Never trust only the JWT role. Re-check the current user record from storage.
+  const currentUser = users[req.user?.id];
+  if (!currentUser || currentUser.role !== 'admin') {
+    return res.status(403).json({ error: 'Admin access required' });
+  }
+  req.currentUser = currentUser;
   next();
 }
 
