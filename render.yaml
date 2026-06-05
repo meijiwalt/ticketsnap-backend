@@ -2,10 +2,12 @@ services:
   - type: web
     name: ticketsnap-backend
     env: node
-    buildCommand: npm install
+    buildCommand: npm install && npx playwright install chromium
     startCommand: npm start
     envVars:
-      - key: TELEGRAM_TOKEN
+      - key: PLAYWRIGHT_BROWSERS_PATH
+        value: /opt/render/.cache/ms-playwright
+      - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: TELEGRAM_CHAT_ID
         sync: false
