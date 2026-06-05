@@ -362,6 +362,9 @@ async function checkAvailability(id, manual = false) {
     m.lastPositiveHits = result.positiveHits || [];
     m.lastNegativeHits = result.negativeHits || [];
     m.lastMatchedActions = matchedActions;
+    const preferredAction = matchedActions.find(a => a && a.href && /^https?:\/\//i.test(String(a.href)));
+    m.preferredManualUrl = preferredAction ? preferredAction.href : null;
+    m.preferredManualLabel = preferredAction ? `Matched link: ${(preferredAction.matchedKeywords || []).join(', ') || preferredAction.text || 'keyword'}` : null;
     m.lastCheckEngine = snapshot.engine;
     m.finalUrl = snapshot.finalUrl || m.ticketUrl;
     m.pageChangeCount = (m.pageChangeCount || 0) + (pageChanged ? 1 : 0);
@@ -386,7 +389,7 @@ async function checkAvailability(id, manual = false) {
       m.status = 'available';
       m.availableAt = nowIso;
       addActivity(m, 'availability', result.reason);
-      await sendTelegram(`🎟 <b>POSSIBLE TICKET AVAILABILITY DETECTED</b>\n\n<b>${m.eventName}</b>\n${result.reason}\n\n👉 <a href="${m.ticketUrl}">Open official ticket page now</a>`);
+      await sendTelegram(`🎟 <b>POSSIBLE TICKET AVAILABILITY DETECTED</b>\n\n<b>${m.eventName}</b>\n${result.reason}\n\n👉 <a href="${m.preferredManualUrl || m.ticketUrl}">${m.preferredManualUrl ? 'Open matched ticket link manually' : 'Open official ticket page now'}</a>`);
     } else if (!result.available && m.status !== 'stopped') {
       // Important: sale time alone is NOT availability.
       // Keep monitoring until the official page check finds real positive availability signals.
@@ -394,7 +397,7 @@ async function checkAvailability(id, manual = false) {
       m.availableAt = null;
     }
     saveData();
-    return { ...result, httpStatus: snapshot.status, engine: snapshot.engine, manual, pageChanged, signals: m.lastSignals, positiveHits: m.lastPositiveHits, negativeHits: m.lastNegativeHits, matchedActions: m.lastMatchedActions }; 
+    return { ...result, httpStatus: snapshot.status, engine: snapshot.engine, manual, pageChanged, signals: m.lastSignals, positiveHits: m.lastPositiveHits, negativeHits: m.lastNegativeHits, matchedActions: m.lastMatchedActions, preferredManualUrl: m.preferredManualUrl, preferredManualLabel: m.preferredManualLabel }; 
   } catch (e) {
     m.lastCheckedAt = new Date().toISOString();
     m.lastCheckReason = 'Check failed';
@@ -566,7 +569,8 @@ app.post('/api/monitor/analyze-url', requireAuth, async (req, res) => {
     const html = snapshot.html || snapshot.text || '';
     const result = analyzeAvailability(html, pos, neg, snapshot.status, snapshot.engine);
     const matchedActions = findMatchedActions(snapshot.candidates || [], pos, neg, snapshot.finalUrl || ticketUrl);
-    res.json({ ok: true, httpStatus: snapshot.status, engine: snapshot.engine, result, signals: summarizePage(html, pos, neg), matchedActions });
+    const preferredAction = matchedActions.find(a => a && a.href && /^https?:\/\//i.test(String(a.href)));
+    res.json({ ok: true, httpStatus: snapshot.status, engine: snapshot.engine, result, signals: summarizePage(html, pos, neg), matchedActions, preferredManualUrl: preferredAction ? preferredAction.href : null });
   } catch (e) {
     res.status(502).json({ error: e.message });
   }
