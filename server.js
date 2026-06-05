@@ -234,7 +234,7 @@ function findMatchedActions(candidates = [], positiveKeywords = [], negativeKeyw
       href,
       matchedKeywords: matchedPositive.slice(0, 6),
       manualOnly: true,
-      note: href ? 'Open this matched official link manually.' : 'Matched a page control. Open the official page and click it manually; TicketSnap will not remote-click ticketing controls.'
+      note: href ? 'Open this matched official link manually.' : 'Matched a page control. Open the ticketing page and click it manually; TicketSnap will not remote-click ticketing controls.'
     });
     if (out.length >= 10) break;
   }
@@ -271,7 +271,7 @@ async function fetchPageSnapshot(url) {
     await page.waitForTimeout(1500);
     const snapshot = await page.evaluate(() => {
       const candidates = Array.from(document.querySelectorAll('a,button,[role="button"]')).slice(0, 220).map(el => {
-        const rawHref = el.href || el.getAttribute('href') || el.getAttribute('data-href') || el.getAttribute('data-url') || '';
+        const rawHref = el.getAttribute('data-href') || el.getAttribute('href') || el.getAttribute('data-url') || el.href || '';
         const text = (el.innerText || el.textContent || el.getAttribute('aria-label') || el.getAttribute('title') || '').replace(/\s+/g, ' ').trim().slice(0, 180);
         return {
           type: el.tagName.toLowerCase() === 'a' ? 'link' : 'button',
@@ -331,7 +331,7 @@ function analyzeAvailability(html, positiveKeywords = DEFAULT_POSITIVE_KEYWORDS,
     return {
       available: false,
       blocked: true,
-      reason: `Checker blocked by website / HTTP ${httpStatus}. TicketSnap could not read the real event page, so keyword results are not reliable. Use the Pre-open official page button and check manually.`,
+      reason: `Checker blocked by website / HTTP ${httpStatus}. TicketSnap could not read the real event page, so keyword results are not reliable. Use the Pre-open ticketing page button and check manually.`,
       positiveHits,
       negativeHits
     };
@@ -362,6 +362,15 @@ async function checkAvailability(id, manual = false) {
     m.lastPositiveHits = result.positiveHits || [];
     m.lastNegativeHits = result.negativeHits || [];
     m.lastMatchedActions = matchedActions;
+    m.lastDiagnostics = {
+      title: (html.split('
+')[0] || '').slice(0, 180),
+      finalUrl: snapshot.finalUrl || m.ticketUrl,
+      candidateCount: Array.isArray(snapshot.candidates) ? snapshot.candidates.length : 0,
+      blocked: result.blocked,
+      status: snapshot.status,
+      engine: snapshot.engine
+    };
     const preferredAction = matchedActions.find(a => a && a.href && /^https?:\/\//i.test(String(a.href)));
     m.preferredManualUrl = preferredAction ? preferredAction.href : null;
     m.preferredManualLabel = preferredAction ? `Matched link: ${(preferredAction.matchedKeywords || []).join(', ') || preferredAction.text || 'keyword'}` : null;
@@ -374,9 +383,9 @@ async function checkAvailability(id, manual = false) {
     if (manual) addActivity(m, result.blocked ? 'blocked' : 'manual-check', `Manual check completed: ${result.reason}`);
     if (pageChanged) {
       m.lastChangedAt = nowIso;
-      addActivity(m, 'page-change', 'Official event page content changed. Review the event page manually.');
+      addActivity(m, 'page-change', 'Ticketing event page content changed. Review the event page manually.');
       if (m.alertOnPageChange !== false) {
-        await sendTelegram(`🔎 <b>TicketSnap page change detected</b>\n\n<b>${m.eventName}</b>\nReason: ${result.reason}\n\n👉 <a href="${m.ticketUrl}">Open official ticket page</a>`);
+        await sendTelegram(`🔎 <b>TicketSnap page change detected</b>\n\n<b>${m.eventName}</b>\nReason: ${result.reason}\n\n👉 <a href="${m.ticketUrl}">Open ticketing page</a>`);
       }
     }
 
@@ -389,10 +398,10 @@ async function checkAvailability(id, manual = false) {
       m.status = 'available';
       m.availableAt = nowIso;
       addActivity(m, 'availability', result.reason);
-      await sendTelegram(`🎟 <b>POSSIBLE TICKET AVAILABILITY DETECTED</b>\n\n<b>${m.eventName}</b>\n${result.reason}\n\n👉 <a href="${m.preferredManualUrl || m.ticketUrl}">${m.preferredManualUrl ? 'Open matched ticket link manually' : 'Open official ticket page now'}</a>`);
+      await sendTelegram(`🎟 <b>POSSIBLE TICKET AVAILABILITY DETECTED</b>\n\n<b>${m.eventName}</b>\n${result.reason}\n\n👉 <a href="${m.preferredManualUrl || m.ticketUrl}">${m.preferredManualUrl ? 'Open matched ticket link manually' : 'Open ticketing page now'}</a>`);
     } else if (!result.available && m.status !== 'stopped') {
       // Important: sale time alone is NOT availability.
-      // Keep monitoring until the official page check finds real positive availability signals.
+      // Keep monitoring until the ticketing page check finds real positive availability signals.
       m.status = 'checking';
       m.availableAt = null;
     }
@@ -419,7 +428,7 @@ function scheduleAlerts(id) {
     const delay = saleMs - offsetMs - now;
     if (delay > 0) m.timers.push(setTimeout(fn, delay));
   };
-  add(15 * 60 * 1000, () => sendTelegram(`🕒 <b>15 minutes to go</b>\n\n<b>${m.eventName}</b> tickets may open soon. Open your browser and be ready.\n\n👉 <a href="${m.ticketUrl}">Official event page</a>`));
+  add(15 * 60 * 1000, () => sendTelegram(`🕒 <b>15 minutes to go</b>\n\n<b>${m.eventName}</b> tickets may open soon. Open your browser and be ready.\n\n👉 <a href="${m.ticketUrl}">Ticketing event page</a>`));
   add(5 * 60 * 1000, () => sendTelegram(`⏰ <b>5 minutes to go!</b>\n\n<b>${m.eventName}</b> tickets may open in 5 minutes.\n\n👉 <a href="${m.ticketUrl}">Get ready</a>`));
   add(1 * 60 * 1000, () => sendTelegram(`🔔 <b>1 minute!</b>\n\n<b>${m.eventName}</b> — be ready on your screen.\n\n👉 <a href="${m.ticketUrl}">Stand by</a>`));
   add(0, async () => {
@@ -429,7 +438,7 @@ function scheduleAlerts(id) {
       monitors[id].saleTimeReached = true;
     }
     saveData();
-    await sendTelegram(`🎟 <b>SALE TIME REACHED</b>\n\n<b>${m.eventName}</b>\nThis is only the scheduled sale time. TicketSnap will still wait for page signals before marking tickets as available.\n\n👉 <a href="${m.ticketUrl}">Open official ticket page</a>`);
+    await sendTelegram(`🎟 <b>SALE TIME REACHED</b>\n\n<b>${m.eventName}</b>\nThis is only the scheduled sale time. TicketSnap will still wait for page signals before marking tickets as available.\n\n👉 <a href="${m.ticketUrl}">Open ticketing page</a>`);
     checkAvailability(id, true);
   });
   if (saleMs <= now && m.status !== 'available' && m.status !== 'stopped') {
@@ -570,7 +579,7 @@ app.post('/api/monitor/analyze-url', requireAuth, async (req, res) => {
     const result = analyzeAvailability(html, pos, neg, snapshot.status, snapshot.engine);
     const matchedActions = findMatchedActions(snapshot.candidates || [], pos, neg, snapshot.finalUrl || ticketUrl);
     const preferredAction = matchedActions.find(a => a && a.href && /^https?:\/\//i.test(String(a.href)));
-    res.json({ ok: true, httpStatus: snapshot.status, engine: snapshot.engine, result, signals: summarizePage(html, pos, neg), matchedActions, preferredManualUrl: preferredAction ? preferredAction.href : null });
+    res.json({ ok: true, httpStatus: snapshot.status, engine: snapshot.engine, result, signals: summarizePage(html, pos, neg), matchedActions, preferredManualUrl: preferredAction ? preferredAction.href : null, diagnostics: { title: (html.split('\n')[0] || '').slice(0,180), finalUrl: snapshot.finalUrl || ticketUrl, candidateCount: Array.isArray(snapshot.candidates) ? snapshot.candidates.length : 0, blocked: result.blocked, status: snapshot.status } });
   } catch (e) {
     res.status(502).json({ error: e.message });
   }
