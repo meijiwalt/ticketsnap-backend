@@ -18,6 +18,8 @@ const JWT_SECRET       = process.env.JWT_SECRET || 'CHANGE_ME_IN_RENDER_ENV';
 const DATA_FILE        = process.env.DATA_FILE || path.join(__dirname, 'data.json');
 const DEFAULT_INTERVAL = Math.max(30, Number(process.env.DEFAULT_CHECK_INTERVAL_SEC || 60));
 const MIN_INTERVAL     = Math.max(20, Number(process.env.MIN_CHECK_INTERVAL_SEC || 30));
+const USE_BROWSER_CHECKER = String(process.env.USE_BROWSER_CHECKER || 'true').toLowerCase() !== 'false';
+const BROWSER_CHECK_TIMEOUT_MS = Math.max(15000, Number(process.env.BROWSER_CHECK_TIMEOUT_MS || 25000));
 
 const users = {};
 const monitors = {};
@@ -96,13 +98,50 @@ async function sendTelegram(message) {
   }
 }
 
+function decodeEntities(text = '') {
+  return String(text)
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;|&apos;/gi, "'")
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&#(\d+);/g, (_, n) => {
+      try { return String.fromCharCode(Number(n)); } catch { return ' '; }
+    });
+}
+
 function normalizeText(html = '') {
-  return String(html)
-    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+  return decodeEntities(String(html))
+    // Keep JSON/JS text too because many ticket pages store button labels in embedded scripts.
     .replace(/<style[\s\S]*?<\/style>/gi, ' ')
     .replace(/<[^>]+>/g, ' ')
+    .replace(/[\u200B-\u200D\uFEFF]/g, '')
+    .replace(/[^a-z0-9$%&:/.?=_#-]+/gi, ' ')
     .replace(/\s+/g, ' ')
+    .trim()
     .toLowerCase();
+}
+
+function keywordRegex(keyword = '') {
+  const normalized = normalizeText(keyword);
+  if (!normalized) return null;
+  const escaped = normalized.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  // Allow spaces, dashes, underscores, newlines, or HTML tags/entities between words.
+  return new RegExp(escaped.replace(/\\ /g, '[\\s\\-_]+'), 'i');
+}
+
+function findKeywordHits(searchText, keywords = []) {
+  const text = normalizeText(searchText);
+  const raw = decodeEntities(String(searchText)).toLowerCase();
+  return [...new Set((keywords || [])
+    .map(k => String(k || '').trim())
+    .filter(Boolean)
+    .filter(k => {
+      const nk = normalizeText(k);
+      const rx = keywordRegex(k);
+      return (nk && text.includes(nk)) || (rx && rx.test(raw));
+    }))];
 }
 
 const DEFAULT_POSITIVE_KEYWORDS = [
@@ -119,38 +158,92 @@ function hashContent(input = '') {
   return crypto.createHash('sha256').update(String(input).slice(0, 750000)).digest('hex');
 }
 
-function addActivity(m, type, message) {
-  m.activity = Array.isArray(m.activity) ? m.activity.slice(-29) : [];
-  m.activity.push({ at: new Date().toISOString(), type, message });
+
+function absolutizeUrl(href = '', base = '') {
+  try { return new URL(href, base).toString(); } catch { return ''; }
 }
 
-function summarizePage(html = '') {
-  const text = normalizeText(html);
-  const snippets = [];
-  const watchTerms = [...DEFAULT_POSITIVE_KEYWORDS, ...DEFAULT_NEGATIVE_KEYWORDS, 'presale', 'onsale', 'sold out', 'unavailable'];
-  for (const term of watchTerms) {
-    const idx = text.indexOf(term);
-    if (idx >= 0) snippets.push(text.slice(Math.max(0, idx - 90), idx + term.length + 120));
-    if (snippets.length >= 5) break;
+function textHasKeyword(text = '', keyword = '') {
+  const nk = normalizeText(keyword);
+  if (!nk) return false;
+  const nt = normalizeText(text);
+  const rx = keywordRegex(keyword);
+  return nt.includes(nk) || (rx && rx.test(decodeEntities(String(text)).toLowerCase()));
+}
+
+function getAttr(attrs = '', name = '') {
+  const rxQuoted = new RegExp(`${name}\\s*=\\s*[\"']([^\"']+)[\"']`, 'i');
+  const rxBare = new RegExp(`${name}\\s*=\\s*([^\\s>]+)`, 'i');
+  const m = attrs.match(rxQuoted) || attrs.match(rxBare);
+  return m ? decodeEntities(m[1] || '') : '';
+}
+
+function cleanElementText(input = '') {
+  return decodeEntities(String(input))
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/[\u200B-\u200D\uFEFF]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function extractClickableCandidatesFromHtml(html = '', baseUrl = '') {
+  const candidates = [];
+  const anchorRx = /<a\b([^>]*)>([\s\S]*?)<\/a>/gi;
+  let match;
+  while ((match = anchorRx.exec(html)) && candidates.length < 120) {
+    const attrs = match[1] || '';
+    const inner = match[2] || '';
+    // Ticketmaster Philippines often stores the real destination in data-href.
+    const rawHref = getAttr(attrs, 'href') || getAttr(attrs, 'data-href') || getAttr(attrs, 'data-url');
+    const href = rawHref ? absolutizeUrl(rawHref, baseUrl) : '';
+    const text = cleanElementText(inner).slice(0, 180);
+    const aria = getAttr(attrs, 'aria-label') || getAttr(attrs, 'title');
+    const hay = `${text} ${aria} ${href}`.trim();
+    if (hay) candidates.push({ type: 'link', text: text || aria || href, href, actionable: Boolean(href) });
   }
-  return [...new Set(snippets)];
+  const buttonRx = /<button\b([^>]*)>([\s\S]*?)<\/button>/gi;
+  while ((match = buttonRx.exec(html)) && candidates.length < 180) {
+    const attrs = match[1] || '';
+    const text = cleanElementText(match[2] || '').slice(0, 180);
+    const aria = getAttr(attrs, 'aria-label') || getAttr(attrs, 'title');
+    const rawHref = getAttr(attrs, 'href') || getAttr(attrs, 'data-href') || getAttr(attrs, 'data-url');
+    const href = rawHref ? absolutizeUrl(rawHref, baseUrl) : '';
+    if (text || aria || href) candidates.push({ type: 'button', text: text || aria || href, href, actionable: Boolean(href) });
+  }
+  return candidates;
 }
 
-function analyzeAvailability(html, positiveKeywords = DEFAULT_POSITIVE_KEYWORDS, negativeKeywords = DEFAULT_NEGATIVE_KEYWORDS) {
-  const text = normalizeText(html);
-  const negativeHit = negativeKeywords.find(k => text.includes(k.toLowerCase()));
-  const positiveHit = positiveKeywords.find(k => text.includes(k.toLowerCase()));
-  if (positiveHit && !negativeHit) return { available: true, reason: `Matched: ${positiveHit}` };
-  if (positiveHit && negativeHit) return { available: false, reason: `Mixed signal: ${positiveHit}; also found ${negativeHit}` };
-  if (negativeHit) return { available: false, reason: `Not available signal: ${negativeHit}` };
-  return { available: false, reason: 'No availability keyword found' };
+function findMatchedActions(candidates = [], positiveKeywords = [], negativeKeywords = [], baseUrl = '') {
+  const out = [];
+  const seen = new Set();
+  for (const c of candidates) {
+    const hay = `${c.text || ''} ${c.href || ''}`;
+    const matchedPositive = (positiveKeywords || []).filter(k => textHasKeyword(hay, k));
+    if (!matchedPositive.length) continue;
+    const matchedNegative = (negativeKeywords || []).filter(k => textHasKeyword(hay, k));
+    if (matchedNegative.length) continue;
+    const href = c.href ? absolutizeUrl(c.href, baseUrl) : '';
+    const key = `${c.type}|${href}|${c.text}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({
+      type: c.type || 'element',
+      text: String(c.text || '').slice(0, 180),
+      href,
+      matchedKeywords: matchedPositive.slice(0, 6),
+      manualOnly: true,
+      note: href ? 'Open this matched official link manually.' : 'Matched a page control. Open the official page and click it manually; TicketSnap will not remote-click ticketing controls.'
+    });
+    if (out.length >= 10) break;
+  }
+  return out;
 }
 
-async function checkAvailability(id, manual = false) {
-  const m = monitors[id];
-  if (!m || m.status === 'stopped') return null;
-  try {
-    const r = await axios.get(m.ticketUrl, {
+async function fetchPageSnapshot(url) {
+  if (!USE_BROWSER_CHECKER) {
+    const r = await axios.get(url, {
       timeout: 12000,
       maxRedirects: 5,
       headers: {
@@ -163,15 +256,100 @@ async function checkAvailability(id, manual = false) {
       validateStatus: s => s >= 200 && s < 500
     });
     const html = typeof r.data === 'string' ? r.data : JSON.stringify(r.data);
+    return { html, text: normalizeText(html), status: r.status, engine: 'http', candidates: extractClickableCandidatesFromHtml(html, url), finalUrl: url };
+  }
+
+  try {
+    const { chromium } = require('playwright');
+    const browser = await chromium.launch({ args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    const page = await browser.newPage({
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125 Safari/537.36',
+      viewport: { width: 1365, height: 900 }
+    });
+    const resp = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: BROWSER_CHECK_TIMEOUT_MS });
+    try { await page.waitForLoadState('networkidle', { timeout: 6000 }); } catch {}
+    await page.waitForTimeout(1500);
+    const snapshot = await page.evaluate(() => {
+      const candidates = Array.from(document.querySelectorAll('a,button,[role="button"]')).slice(0, 220).map(el => {
+        const rawHref = el.href || el.getAttribute('href') || el.getAttribute('data-href') || el.getAttribute('data-url') || '';
+        const text = (el.innerText || el.textContent || el.getAttribute('aria-label') || el.getAttribute('title') || '').replace(/\s+/g, ' ').trim().slice(0, 180);
+        return {
+          type: el.tagName.toLowerCase() === 'a' ? 'link' : 'button',
+          text: text || rawHref,
+          href: rawHref,
+          actionable: Boolean(rawHref)
+        };
+      }).filter(x => x.text || x.href);
+      return {
+        html: document.documentElement.outerHTML || '',
+        text: document.body ? (document.body.innerText || document.body.textContent || '') : '',
+        candidates,
+        title: document.title || '',
+        finalUrl: location.href
+      };
+    });
+    const status = resp ? resp.status() : 0;
+    await browser.close();
+    return { html: `${snapshot.title}\n${snapshot.text}\n${snapshot.html}`, text: snapshot.text, status, engine: 'browser', candidates: snapshot.candidates, finalUrl: snapshot.finalUrl || url };
+  } catch (browserError) {
+    console.warn('[Checker] Browser check failed, falling back to HTTP:', browserError.message);
+    const r = await axios.get(url, { timeout: 12000, maxRedirects: 5, validateStatus: s => s >= 200 && s < 500 });
+    const html = typeof r.data === 'string' ? r.data : JSON.stringify(r.data);
+    return { html, text: normalizeText(html), status: r.status, engine: `http-fallback: ${browserError.message}`, candidates: extractClickableCandidatesFromHtml(html, url), finalUrl: url };
+  }
+}
+
+function addActivity(m, type, message) {
+  m.activity = Array.isArray(m.activity) ? m.activity.slice(-29) : [];
+  m.activity.push({ at: new Date().toISOString(), type, message });
+}
+
+function summarizePage(html = '', positiveKeywords = DEFAULT_POSITIVE_KEYWORDS, negativeKeywords = DEFAULT_NEGATIVE_KEYWORDS) {
+  const text = normalizeText(html);
+  const snippets = [];
+  const watchTerms = [...positiveKeywords, ...negativeKeywords, ...DEFAULT_POSITIVE_KEYWORDS, ...DEFAULT_NEGATIVE_KEYWORDS, 'presale', 'onsale', 'sold out', 'unavailable'];
+  for (const term of watchTerms) {
+    const needle = normalizeText(term);
+    if (!needle) continue;
+    const idx = text.indexOf(needle);
+    if (idx >= 0) snippets.push(text.slice(Math.max(0, idx - 90), idx + needle.length + 120));
+    if (snippets.length >= 8) break;
+  }
+  return [...new Set(snippets)];
+}
+
+function analyzeAvailability(html, positiveKeywords = DEFAULT_POSITIVE_KEYWORDS, negativeKeywords = DEFAULT_NEGATIVE_KEYWORDS) {
+  const positiveHits = findKeywordHits(html, positiveKeywords);
+  const negativeHits = findKeywordHits(html, negativeKeywords);
+  const positiveHit = positiveHits[0];
+  const negativeHit = negativeHits[0];
+  if (positiveHit && !negativeHit) return { available: true, reason: `Matched keyword: ${positiveHit}`, positiveHits, negativeHits };
+  if (positiveHit && negativeHit) return { available: false, reason: `Mixed signal: matched ${positiveHit}; also found negative keyword ${negativeHit}`, positiveHits, negativeHits };
+  if (negativeHit) return { available: false, reason: `Not available signal: ${negativeHit}`, positiveHits, negativeHits };
+  return { available: false, reason: 'No availability keyword found in downloaded page HTML', positiveHits, negativeHits };
+}
+
+async function checkAvailability(id, manual = false) {
+  const m = monitors[id];
+  if (!m || m.status === 'stopped') return null;
+  try {
+    const snapshot = await fetchPageSnapshot(m.ticketUrl);
+    const html = snapshot.html || snapshot.text || '';
     const result = analyzeAvailability(html, m.positiveKeywords, m.negativeKeywords);
+    const matchedActions = findMatchedActions(snapshot.candidates || [], m.positiveKeywords, m.negativeKeywords, snapshot.finalUrl || m.ticketUrl);
     const digest = hashContent(html);
     const pageChanged = Boolean(m.lastContentHash && m.lastContentHash !== digest);
     const nowIso = new Date().toISOString();
     m.lastCheckedAt = nowIso;
-    m.lastHttpStatus = r.status;
+    m.lastHttpStatus = snapshot.status;
     m.lastCheckReason = result.reason;
     m.lastContentHash = digest;
-    m.lastSignals = summarizePage(html);
+    m.lastSignals = summarizePage(html, m.positiveKeywords, m.negativeKeywords);
+    m.lastPositiveHits = result.positiveHits || [];
+    m.lastNegativeHits = result.negativeHits || [];
+    m.lastMatchedActions = matchedActions;
+    m.lastCheckEngine = snapshot.engine;
+    m.finalUrl = snapshot.finalUrl || m.ticketUrl;
     m.pageChangeCount = (m.pageChangeCount || 0) + (pageChanged ? 1 : 0);
     m.checkCount = (m.checkCount || 0) + 1;
     m.error = null;
@@ -197,7 +375,7 @@ async function checkAvailability(id, manual = false) {
       m.availableAt = null;
     }
     saveData();
-    return { ...result, httpStatus: r.status, manual, pageChanged, signals: m.lastSignals };
+    return { ...result, httpStatus: snapshot.status, engine: snapshot.engine, manual, pageChanged, signals: m.lastSignals, positiveHits: m.lastPositiveHits, negativeHits: m.lastNegativeHits, matchedActions: m.lastMatchedActions }; 
   } catch (e) {
     m.lastCheckedAt = new Date().toISOString();
     m.lastCheckReason = 'Check failed';
@@ -363,13 +541,13 @@ app.post('/api/monitor/analyze-url', requireAuth, async (req, res) => {
   const { ticketUrl, positiveKeywords, negativeKeywords } = req.body;
   if (!ticketUrl || !/^https?:\/\//i.test(ticketUrl)) return res.status(400).json({ error: 'Valid ticketUrl required' });
   try {
-    const r = await axios.get(ticketUrl, { timeout: 12000, maxRedirects: 5, validateStatus: s => s >= 200 && s < 500 });
-    const html = typeof r.data === 'string' ? r.data : JSON.stringify(r.data);
-    const result = analyzeAvailability(html,
-      Array.isArray(positiveKeywords) && positiveKeywords.length ? positiveKeywords : DEFAULT_POSITIVE_KEYWORDS,
-      Array.isArray(negativeKeywords) && negativeKeywords.length ? negativeKeywords : DEFAULT_NEGATIVE_KEYWORDS
-    );
-    res.json({ ok: true, httpStatus: r.status, result, signals: summarizePage(html) });
+    const pos = Array.isArray(positiveKeywords) && positiveKeywords.length ? positiveKeywords : DEFAULT_POSITIVE_KEYWORDS;
+    const neg = Array.isArray(negativeKeywords) && negativeKeywords.length ? negativeKeywords : DEFAULT_NEGATIVE_KEYWORDS;
+    const snapshot = await fetchPageSnapshot(ticketUrl);
+    const html = snapshot.html || snapshot.text || '';
+    const result = analyzeAvailability(html, pos, neg);
+    const matchedActions = findMatchedActions(snapshot.candidates || [], pos, neg, snapshot.finalUrl || ticketUrl);
+    res.json({ ok: true, httpStatus: snapshot.status, engine: snapshot.engine, result, signals: summarizePage(html, pos, neg), matchedActions });
   } catch (e) {
     res.status(502).json({ error: e.message });
   }
@@ -394,7 +572,7 @@ app.get('/api/simulator/queue-lessons', requireAuth, (req, res) => {
   });
 });
 
-app.get('/', (req, res) => res.json({ ok: true, service: 'TicketSnap', availabilityChecker: true, safeMode: true }));
+app.get('/', (req, res) => res.json({ ok: true, service: 'TicketSnap', availabilityChecker: true, browserChecker: USE_BROWSER_CHECKER, safeMode: true }));
 
 loadData();
 seedAdmin().then(() => {
