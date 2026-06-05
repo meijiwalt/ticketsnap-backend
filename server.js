@@ -318,15 +318,28 @@ function summarizePage(html = '', positiveKeywords = DEFAULT_POSITIVE_KEYWORDS, 
   return [...new Set(snippets)];
 }
 
-function analyzeAvailability(html, positiveKeywords = DEFAULT_POSITIVE_KEYWORDS, negativeKeywords = DEFAULT_NEGATIVE_KEYWORDS) {
+function isBlockedStatus(status) {
+  return [401, 403, 407, 429, 451].includes(Number(status));
+}
+
+function analyzeAvailability(html, positiveKeywords = DEFAULT_POSITIVE_KEYWORDS, negativeKeywords = DEFAULT_NEGATIVE_KEYWORDS, httpStatus = 0, engine = '') {
   const positiveHits = findKeywordHits(html, positiveKeywords);
   const negativeHits = findKeywordHits(html, negativeKeywords);
   const positiveHit = positiveHits[0];
   const negativeHit = negativeHits[0];
-  if (positiveHit && !negativeHit) return { available: true, reason: `Matched keyword: ${positiveHit}`, positiveHits, negativeHits };
-  if (positiveHit && negativeHit) return { available: false, reason: `Mixed signal: matched ${positiveHit}; also found negative keyword ${negativeHit}`, positiveHits, negativeHits };
-  if (negativeHit) return { available: false, reason: `Not available signal: ${negativeHit}`, positiveHits, negativeHits };
-  return { available: false, reason: 'No availability keyword found in downloaded page HTML', positiveHits, negativeHits };
+  if (isBlockedStatus(httpStatus)) {
+    return {
+      available: false,
+      blocked: true,
+      reason: `Checker blocked by website / HTTP ${httpStatus}. TicketSnap could not read the real event page, so keyword results are not reliable. Use the Pre-open official page button and check manually.`,
+      positiveHits,
+      negativeHits
+    };
+  }
+  if (positiveHit && !negativeHit) return { available: true, blocked: false, reason: `Matched keyword: ${positiveHit}`, positiveHits, negativeHits };
+  if (positiveHit && negativeHit) return { available: false, blocked: false, reason: `Mixed signal: matched ${positiveHit}; also found negative keyword ${negativeHit}`, positiveHits, negativeHits };
+  if (negativeHit) return { available: false, blocked: false, reason: `Not available signal: ${negativeHit}`, positiveHits, negativeHits };
+  return { available: false, blocked: false, reason: 'No availability keyword found in successfully loaded page HTML', positiveHits, negativeHits };
 }
 
 async function checkAvailability(id, manual = false) {
@@ -335,7 +348,7 @@ async function checkAvailability(id, manual = false) {
   try {
     const snapshot = await fetchPageSnapshot(m.ticketUrl);
     const html = snapshot.html || snapshot.text || '';
-    const result = analyzeAvailability(html, m.positiveKeywords, m.negativeKeywords);
+    const result = analyzeAvailability(html, m.positiveKeywords, m.negativeKeywords, snapshot.status, snapshot.engine);
     const matchedActions = findMatchedActions(snapshot.candidates || [], m.positiveKeywords, m.negativeKeywords, snapshot.finalUrl || m.ticketUrl);
     const digest = hashContent(html);
     const pageChanged = Boolean(m.lastContentHash && m.lastContentHash !== digest);
@@ -343,6 +356,7 @@ async function checkAvailability(id, manual = false) {
     m.lastCheckedAt = nowIso;
     m.lastHttpStatus = snapshot.status;
     m.lastCheckReason = result.reason;
+    m.lastBlocked = Boolean(result.blocked);
     m.lastContentHash = digest;
     m.lastSignals = summarizePage(html, m.positiveKeywords, m.negativeKeywords);
     m.lastPositiveHits = result.positiveHits || [];
@@ -354,13 +368,18 @@ async function checkAvailability(id, manual = false) {
     m.checkCount = (m.checkCount || 0) + 1;
     m.error = null;
 
-    if (manual) addActivity(m, 'manual-check', `Manual check completed: ${result.reason}`);
+    if (manual) addActivity(m, result.blocked ? 'blocked' : 'manual-check', `Manual check completed: ${result.reason}`);
     if (pageChanged) {
       m.lastChangedAt = nowIso;
       addActivity(m, 'page-change', 'Official event page content changed. Review the event page manually.');
       if (m.alertOnPageChange !== false) {
         await sendTelegram(`🔎 <b>TicketSnap page change detected</b>\n\n<b>${m.eventName}</b>\nReason: ${result.reason}\n\n👉 <a href="${m.ticketUrl}">Open official ticket page</a>`);
       }
+    }
+
+    if (result.blocked) {
+      m.status = 'blocked';
+      m.availableAt = null;
     }
 
     if (result.available && m.status !== 'available') {
@@ -545,7 +564,7 @@ app.post('/api/monitor/analyze-url', requireAuth, async (req, res) => {
     const neg = Array.isArray(negativeKeywords) && negativeKeywords.length ? negativeKeywords : DEFAULT_NEGATIVE_KEYWORDS;
     const snapshot = await fetchPageSnapshot(ticketUrl);
     const html = snapshot.html || snapshot.text || '';
-    const result = analyzeAvailability(html, pos, neg);
+    const result = analyzeAvailability(html, pos, neg, snapshot.status, snapshot.engine);
     const matchedActions = findMatchedActions(snapshot.candidates || [], pos, neg, snapshot.finalUrl || ticketUrl);
     res.json({ ok: true, httpStatus: snapshot.status, engine: snapshot.engine, result, signals: summarizePage(html, pos, neg), matchedActions });
   } catch (e) {
