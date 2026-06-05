@@ -16,11 +16,32 @@ const TELEGRAM_TOKEN   = process.env.TELEGRAM_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const JWT_SECRET       = process.env.JWT_SECRET || 'CHANGE_ME_IN_RENDER_ENV';
 const DATA_FILE        = process.env.DATA_FILE || path.join(__dirname, 'data.json');
-const DEFAULT_INTERVAL = Math.max(15, Number(process.env.DEFAULT_CHECK_INTERVAL_SEC || 30));
-// Keep this reasonable so the private checker does not hammer ticketing sites.
-const MIN_INTERVAL     = Math.max(5, Number(process.env.MIN_CHECK_INTERVAL_SEC || 15));
+const DEFAULT_INTERVAL = Math.max(30, Number(process.env.DEFAULT_CHECK_INTERVAL_SEC || 60));
+// Keep this reasonable so the private checker does not hammer ticketing sites or exceed Render CPU limits.
+const MIN_INTERVAL     = Math.max(15, Number(process.env.MIN_CHECK_INTERVAL_SEC || 30));
 const USE_BROWSER_CHECKER = String(process.env.USE_BROWSER_CHECKER || 'true').toLowerCase() !== 'false';
-const BROWSER_CHECK_TIMEOUT_MS = Math.max(15000, Number(process.env.BROWSER_CHECK_TIMEOUT_MS || 25000));
+const BROWSER_CHECK_TIMEOUT_MS = Math.max(10000, Number(process.env.BROWSER_CHECK_TIMEOUT_MS || 18000));
+const BACKGROUND_FIRST_CHECK_DELAY_MS = Math.max(250, Number(process.env.BACKGROUND_FIRST_CHECK_DELAY_MS || 1000));
+let browserPromise = null;
+async function getSharedBrowser() {
+  if (!browserPromise) {
+    const { chromium } = require('playwright');
+    browserPromise = chromium.launch({ headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+  }
+  try {
+    return await browserPromise;
+  } catch (e) {
+    browserPromise = null;
+    throw e;
+  }
+}
+async function closeSharedBrowser() {
+  if (!browserPromise) return;
+  try { (await browserPromise).close(); } catch {}
+  browserPromise = null;
+}
+process.on('SIGTERM', () => { closeSharedBrowser().finally(() => process.exit(0)); });
+process.on('SIGINT', () => { closeSharedBrowser().finally(() => process.exit(0)); });
 
 const users = {};
 const monitors = {};
@@ -202,7 +223,7 @@ function extractClickableCandidatesFromHtml(html = '', baseUrl = '') {
   const candidates = [];
   const anchorRx = /<a\b([^>]*)>([\s\S]*?)<\/a>/gi;
   let match;
-  while ((match = anchorRx.exec(html)) && candidates.length < 120) {
+  while ((match = anchorRx.exec(html)) && candidates.length < 500) {
     const attrs = match[1] || '';
     const inner = match[2] || '';
     // Ticketmaster Philippines often stores the real destination in data-href.
@@ -214,7 +235,7 @@ function extractClickableCandidatesFromHtml(html = '', baseUrl = '') {
     if (hay) candidates.push({ type: 'link', text: text || aria || href, href, actionable: Boolean(href) });
   }
   const buttonRx = /<button\b([^>]*)>([\s\S]*?)<\/button>/gi;
-  while ((match = buttonRx.exec(html)) && candidates.length < 180) {
+  while ((match = buttonRx.exec(html)) && candidates.length < 650) {
     const attrs = match[1] || '';
     const text = cleanElementText(match[2] || '').slice(0, 180);
     const aria = getAttr(attrs, 'aria-label') || getAttr(attrs, 'title');
@@ -246,7 +267,7 @@ function findMatchedActions(candidates = [], positiveKeywords = [], negativeKeyw
       manualOnly: true,
       note: href ? 'Open this matched official link manually.' : 'Matched a page control. Open the ticketing page and click it manually; TicketSnap will not remote-click ticketing controls.'
     });
-    if (out.length >= 10) break;
+    if (out.length >= 30) break;
   }
   return out;
 }
@@ -271,7 +292,7 @@ async function fetchPageSnapshot(url) {
 
   try {
     const { chromium } = require('playwright');
-    const browser = await chromium.launch({ args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    const browser = await getSharedBrowser();
     const page = await browser.newPage({
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125 Safari/537.36',
       viewport: { width: 1365, height: 900 }
@@ -299,7 +320,7 @@ async function fetchPageSnapshot(url) {
       };
     });
     const status = resp ? resp.status() : 0;
-    await browser.close();
+    await page.close();
     return { html: `${snapshot.title}\n${snapshot.text}\n${snapshot.html}`, text: snapshot.text, status, engine: 'browser', candidates: snapshot.candidates, finalUrl: snapshot.finalUrl || url };
   } catch (browserError) {
     console.warn('[Checker] Browser check failed, falling back to HTTP:', browserError.message);
@@ -355,6 +376,10 @@ function analyzeAvailability(html, positiveKeywords = DEFAULT_POSITIVE_KEYWORDS,
 async function checkAvailability(id, manual = false) {
   const m = monitors[id];
   if (!m || m.status === 'stopped') return null;
+  if (m.checkInProgress) {
+    return { available: false, reason: 'Previous check is still running. Skipped overlapping check.', skipped: true, manual };
+  }
+  m.checkInProgress = true;
   try {
     const snapshot = await fetchPageSnapshot(m.ticketUrl);
     const html = snapshot.html || snapshot.text || '';
@@ -423,6 +448,8 @@ async function checkAvailability(id, manual = false) {
     addActivity(m, 'error', e.message);
     saveData();
     return { available: false, reason: e.message, manual };
+  } finally {
+    if (monitors[id]) monitors[id].checkInProgress = false;
   }
 }
 
@@ -460,21 +487,40 @@ async function startAvailabilityChecker(id) {
   const m = monitors[id];
   if (!m || !m.availabilityCheck || m.status === 'stopped') return;
   if (m.checker) clearInterval(m.checker);
-  const tick = () => {
-    checkAvailability(id, false);
+
+  const runCheck = () => {
     const fresh = monitors[id];
-    if (!fresh || fresh.status === 'stopped') return;
+    if (!fresh || fresh.status === 'stopped' || fresh.checkInProgress) return;
+    checkAvailability(id, false).catch(e => console.error('[Checker] background error:', e.message));
+  };
+
+  const getAdaptiveIntervalSec = () => {
+    const fresh = monitors[id];
+    if (!fresh) return DEFAULT_INTERVAL;
     const saleMs = new Date(fresh.saleTime).getTime();
     const minutesToSale = (saleMs - Date.now()) / 60000;
     const configured = Math.max(MIN_INTERVAL, Number(fresh.checkIntervalSec || DEFAULT_INTERVAL));
-    const adaptive = minutesToSale <= 2 ? Math.min(configured, 5) : minutesToSale <= 10 ? Math.min(configured, 10) : minutesToSale <= 30 ? Math.min(configured, 15) : minutesToSale <= 60 ? Math.min(configured, 20) : Math.min(configured, 30);
-    clearInterval(fresh.checker);
-    fresh.checker = setInterval(tick, adaptive * 1000);
+    const adaptive = minutesToSale <= 2 ? Math.min(configured, 15)
+      : minutesToSale <= 10 ? Math.min(configured, 20)
+      : minutesToSale <= 30 ? Math.min(configured, 30)
+      : minutesToSale <= 60 ? Math.min(configured, 45)
+      : configured;
+    return Math.max(MIN_INTERVAL, adaptive);
   };
-  // Run the first check immediately so the Watch tab does not wait for the first interval.
-  await checkAvailability(id, true);
-  const intervalSec = Math.max(MIN_INTERVAL, Number(m.checkIntervalSec || DEFAULT_INTERVAL));
-  m.checker = setInterval(tick, intervalSec * 1000);
+
+  // Non-blocking first check: Start Monitoring returns immediately, then the check runs in the background.
+  setTimeout(runCheck, BACKGROUND_FIRST_CHECK_DELAY_MS);
+
+  const scheduleNext = () => {
+    const fresh = monitors[id];
+    if (!fresh || fresh.status === 'stopped') return;
+    const wait = getAdaptiveIntervalSec() * 1000;
+    fresh.checker = setTimeout(async () => {
+      runCheck();
+      scheduleNext();
+    }, wait);
+  };
+  scheduleNext();
 }
 
 app.post('/api/auth/login', async (req, res) => {
@@ -537,11 +583,11 @@ app.post('/api/monitor/start', requireAuth, async (req, res) => {
     notes: String(notes || '').slice(0, 500),
     activity: []
   };
-  addActivity(monitors[id], 'created', 'Monitor created and legitimate availability checks started.');
+  addActivity(monitors[id], 'created', 'Monitor created. First availability check will run in the background.');
   scheduleAlerts(id);
-  await startAvailabilityChecker(id);
   saveData();
-  await sendTelegram(`👀 <b>Monitor started</b>\n\nEvent: <b>${eventName}</b>\nSale: <b>${new Date(saleTime).toLocaleString('en-PH', { timeZone: 'Asia/Manila' })} PHT</b>\nAvailability check: <b>${availabilityCheck ? 'ON' : 'OFF'}</b>\nLink: <a href="${ticketUrl}">${ticketUrl}</a>`);
+  startAvailabilityChecker(id).catch(e => console.error('[Checker] start error:', e.message));
+  sendTelegram(`👀 <b>Monitor started</b>\n\nEvent: <b>${eventName}</b>\nSale: <b>${new Date(saleTime).toLocaleString('en-PH', { timeZone: 'Asia/Manila' })} PHT</b>\nAvailability check: <b>${availabilityCheck ? 'ON' : 'OFF'}</b>\nLink: <a href="${ticketUrl}">${ticketUrl}</a>`);
   res.json({ id, status: monitors[id].status });
 });
 
